@@ -228,7 +228,7 @@ import static io.micronaut.inject.visitor.BeanElementVisitor.VISITORS;
  */
 @NullUnmarked
 @Internal
-public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefinitionVisitor, BeanElement, Toggleable, BeanDefinitionBuilder<ClassElement, MethodElement> {
+public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefinitionVisitor, BeanElement, Toggleable, BeanDefinitionBuilder<ClassElement, MethodElement, FieldElement> {
     @NextMajorVersion("Inline as true")
     public static final String OMIT_CONFPROP_INJECTION_POINTS = "micronaut.processing.omit.confprop.injectpoints";
 
@@ -685,7 +685,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     private String interceptedType;
     @Nullable
     private Set<ClassElement> exposes;
-    private final List<FieldVisitData> fieldInjectionPoints = new ArrayList<>(2);
     private final Map<ClassElement, List<AnnotationVisitData>> annotationInjectionPoints = new LinkedHashMap<>(2);
     private final Map<String, Boolean> isLifeCycleCache = new HashMap<>(2);
     private ExecutableMethodsDefinitionWriter executableMethodsDefinitionWriter;
@@ -711,6 +710,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private final List<MethodDefinition<ClassElement, MethodElement>> allMethods = new ArrayList<>();
     private final List<MethodDefinition<ClassElement, MethodElement>> injectedMethods = new ArrayList<>();
+    private final List<FieldDefinition<ClassElement, FieldElement>> allFields = new ArrayList<>();
+    private final List<FieldDefinition<ClassElement, FieldElement>> injectedFields = new ArrayList<>();
     public final List<MethodDefinition<ClassElement, MethodElement>> postConstructMethods = new ArrayList<>();
     private final List<MethodDefinition<ClassElement, MethodElement>> preDestroyMethods = new ArrayList<>();
     private ConstructorDefinition<ClassElement> constructorDefinition;
@@ -894,7 +895,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         this.constructorDefinition = constructorDefinition;
 
         evaluatedExpressionProcessor.processEvaluatedExpressions(constructorDefinition.annotationMetadata(), null);
-        for (BeanDefinitionInjectionPoint<ClassElement> constructorInjectionPoint : constructorDefinition.parameters()) {
+        for (BeanDefinitionInjectionPoint<ClassElement> constructorInjectionPoint : constructorDefinition.injectionPoints()) {
             evaluatedExpressionProcessor.processEvaluatedExpressions(constructorInjectionPoint.getAnnotationMetadata(), null);
         }
     }
@@ -915,6 +916,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     public void addMethodInjection(MethodDefinition<ClassElement, MethodElement> methodDefinition) {
         allMethods.add(methodDefinition);
         injectedMethods.add(methodDefinition);
+    }
+
+    @Override
+    public void addFieldInjection(FieldDefinition<ClassElement, FieldElement> fieldDefinition) {
+        allFields.add(fieldDefinition);
+        injectedFields.add(fieldDefinition);
+        evaluatedExpressionProcessor.processEvaluatedExpressions(fieldDefinition.fieldElement().getAnnotationMetadata(), null);
     }
 
     /**
@@ -1180,34 +1188,20 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 new ConstructorDefinition<>(
                     constructor.getOwningType(),
                     constructor,
-                    Arrays.stream(constructor.getParameters()).map(this::getInjectionPoint).toList(),
+                    Arrays.stream(constructor.getParameters()).map(p -> getInjectionPoint(p.getGenericType(), p, p.getName())).toList(),
                     requiresReflection)
             );
         }
     }
-    private BeanDefinitionInjectionPoint<ClassElement> getInjectionPoint(ParameterElement parameter) {
-        AnnotationMetadata annotationMetadata = parameter.getAnnotationMetadata();
+    private BeanDefinitionInjectionPoint<ClassElement> getInjectionPoint(ClassElement genericType, AnnotationMetadata annotationMetadata, String parameterName) {
         if (isAnnotatedWithParameter(annotationMetadata)) {
-            return new ParameterInjectionPoint<>(parameter.getGenericType(), parameter, parameter.getName());
+            return new ParameterInjectionPoint<>(genericType, annotationMetadata, parameterName);
         }
         boolean isArray;
-        final ClassElement genericType = parameter.getGenericType();
         if (!isInnerType(genericType)) {
-            if (annotationMetadata.hasDeclaredStereotype(Property.class)) {
-                Optional<String> property = parameter.stringValue(Property.class, "name");
-                if (property.isPresent()) {
-                    String value = property.get();
-                    return new PropertyInjectionPoint<>(genericType, parameter, parameter.getName(), value);
-                }
-            }
-            if (annotationMetadata.hasDeclaredStereotype(Value.class)) {
-                Optional<String> valueValue = parameter.stringValue(Value.class);
-                return new ValueInjectionPoint<>(
-                    genericType,
-                    parameter,
-                    valueValue.orElseThrow(() -> new ProcessingException(parameter, "Value injection requires a value")),
-                    parameter.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()
-                );
+            BeanDefinitionInjectionPoint<ClassElement> result = createPropertyOrValueInjectionPoint(genericType, annotationMetadata, parameterName);
+            if (result != null) {
+                return result;
             }
         }
         isArray = genericType.isArray();
@@ -1215,32 +1209,62 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             ClassElement typeArgument = genericType.isArray() ? genericType.fromArray() : genericType.getFirstTypeArgument().orElse(null);
             if (typeArgument != null && !typeArgument.isPrimitive()) {
                 if (typeArgument.isAssignable(BeanRegistration.class)) {
-                    return new BeanRegistrationsInjectionPoint<>(genericType, parameter, typeArgument.getFirstTypeArgument().orElseThrow());
+                    return new BeanRegistrationsInjectionPoint<>(genericType, annotationMetadata, typeArgument.getFirstTypeArgument().orElseThrow());
                 } else {
-                    return new BeansInjectionPoint<>(genericType, parameter, typeArgument);
+                    return new BeansInjectionPoint<>(genericType, annotationMetadata, typeArgument);
                 }
             } else {
-                return new BeanInjectionPoint<>(genericType, parameter);
+                return new BeanInjectionPoint<>(genericType, annotationMetadata);
             }
         } else if (isInjectableMap(genericType)) {
             Map<String, ClassElement> mapArguments = genericType.getTypeArguments(Map.class);
             ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
             ClassElement beanType = mapArguments.getOrDefault("V", objectType);
-            return new MapOfBeansInjectionPoint<>(genericType, parameter, beanType);
+            return new MapOfBeansInjectionPoint<>(genericType, annotationMetadata, beanType);
         } else if (genericType.isAssignable(Stream.class)) {
             ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
             ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
-            return new StreamOfBeansInjectionPoint<>(genericType, parameter, beanType);
+            return new StreamOfBeansInjectionPoint<>(genericType, annotationMetadata, beanType);
         } else if (genericType.isAssignable(Optional.class)) {
             ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
             ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
-            return new OptionalBeanInjectionPoint<>(genericType, parameter, beanType);
+            return new OptionalBeanInjectionPoint<>(genericType, annotationMetadata, beanType);
         } else if (genericType.isAssignable(BeanRegistration.class)) {
             ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
             ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
-            return new BeanRegistrationInjectionPoint<>(genericType, parameter, beanType);
+            return new BeanRegistrationInjectionPoint<>(genericType, annotationMetadata, beanType);
         }
-        return new BeanInjectionPoint<>(genericType, parameter);
+        return new BeanInjectionPoint<>(genericType, annotationMetadata);
+    }
+
+    @Nullable
+    private BeanDefinitionInjectionPoint<ClassElement> createPropertyOrValueInjectionPoint(ClassElement genericType, AnnotationMetadata annotationMetadata, String parameterName) {
+        if (annotationMetadata.hasDeclaredStereotype(Property.class)) {
+            return createPropertyInjection(genericType, annotationMetadata, parameterName);
+        }
+        if (annotationMetadata.hasDeclaredStereotype(Value.class)) {
+            return createValueInjection(genericType, annotationMetadata);
+        }
+        return null;
+    }
+
+    private PropertyInjectionPoint<ClassElement> createPropertyInjection(ClassElement genericType, AnnotationMetadata annotationMetadata, String parameterName) {
+        return new PropertyInjectionPoint<>(
+            genericType,
+            annotationMetadata,
+            parameterName,
+            annotationMetadata.stringValue(Property.class, "name")
+                    .orElseThrow(() -> new ProcessingException(annotationMetadata instanceof Element element ? element : null, "Property [" + parameterName + "] injection requires a value"))
+        );
+    }
+
+    private ValueInjectionPoint<ClassElement> createValueInjection(ClassElement genericType, AnnotationMetadata annotationMetadata) {
+        return new ValueInjectionPoint<>(
+            genericType,
+            annotationMetadata,
+            annotationMetadata.stringValue(Value.class).orElseThrow(() -> new ProcessingException((Element) annotationMetadata, "Value injection requires a value")),
+            annotationMetadata.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()
+        );
     }
 
     @Override
@@ -1356,7 +1380,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         classDefBuilder.addMethod(
             getBuildMethod(buildMethodDefinition)
         );
-        if (!injectCommands.isEmpty() || !injectedMethods.isEmpty()) {
+        if (hasInjection()) {
             classDefBuilder.addMethod(
                 getInjectMethod(injectCommands)
             );
@@ -1531,6 +1555,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                         hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(methodElement.getParameters());
                     }
 
+                    for (FieldDefinition<ClassElement, FieldElement> injectedField : injectedFields) {
+                        statements.add(
+                            injectFieldOptionally(injectMethodSignature, injectedField)
+                        );
+                        hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(injectedField.fieldElement());
+                    }
+
                     List<StatementDef> returnStatements = new ArrayList<>();
                     if (hasInjectPoint) {
                         returnStatements.add(destroyInjectScopeBeansIfNecessary(methodParameters));
@@ -1555,6 +1586,20 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             });
     }
 
+    private StatementDef injectFieldOptionally(InjectMethodSignature injectMethodSignature, FieldDefinition<ClassElement, FieldElement> injectedField) {
+        StatementDef injectFieldStatement = injectField(injectMethodSignature, injectedField);
+        if (injectedField.isOptional()) {
+            FieldElement fieldElement = injectedField.fieldElement();
+            injectFieldStatement = getPropertyContainsCheck(
+                injectMethodSignature,
+                fieldElement.getType(),
+                fieldElement.getName(),
+                fieldElement.getAnnotationMetadata()
+            ).ifTrue(injectFieldStatement);
+        }
+        return injectFieldStatement;
+    }
+
     private StatementDef getInjectStatement(InjectMethodCommand injectionPoint, InjectMethodSignature injectMethodSignature) {
         if (injectionPoint instanceof SetterInjectionInjectCommand setterInjectionInjectCommand) {
             return setSetterValue(
@@ -1564,33 +1609,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 setterInjectionInjectCommand.annotationMetadata,
                 setterInjectionInjectCommand.requiresReflection,
                 setterInjectionInjectCommand.isOptional
-            );
-        }
-        if (injectionPoint instanceof InjectFieldInjectCommand injectFieldInjectCommand) {
-            return injectField(
-                injectMethodSignature,
-                injectFieldInjectCommand.declaringType,
-                injectFieldInjectCommand.fieldElement,
-                injectFieldInjectCommand.requiresReflection
-            );
-        }
-        if (injectionPoint instanceof InjectMethodInjectCommand injectMethodInjectCommand) {
-            return injectMethod(
-                injectMethodInjectCommand.methodElement,
-                injectMethodInjectCommand.requiresReflection,
-                injectMethodSignature.aThis,
-                injectMethodSignature.methodParameters,
-                injectMethodSignature.instanceVar,
-                injectMethodInjectCommand.methodIndex
-            );
-        }
-        if (injectionPoint instanceof InjectFieldValueInjectCommand injectFieldValueInjectCommand) {
-            return setFieldValue(
-                injectMethodSignature,
-                injectFieldValueInjectCommand.declaringType,
-                injectFieldValueInjectCommand.fieldElement,
-                injectFieldValueInjectCommand.requiresReflection,
-                injectFieldValueInjectCommand.isOptional
             );
         }
         if (injectionPoint instanceof ConfigBuilderInjectCommand configBuilderInjectCommand) {
@@ -1726,70 +1744,11 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             });
     }
 
-    private StatementDef setFieldValue(InjectMethodSignature injectMethodSignature,
-                                       TypedElement declaringType,
-                                       FieldElement fieldElement,
-                                       boolean requiresReflection,
-                                       boolean isOptional) {
-        StatementDef setFieldValueStatement = setFieldValue(injectMethodSignature, fieldElement, isOptional, declaringType, requiresReflection);
-
-        if (isOptional) {
-            return getPropertyContainsCheck(
-                injectMethodSignature,
-                fieldElement.getType(),
-                fieldElement.getName(),
-                fieldElement.getAnnotationMetadata()
-            ).ifTrue(setFieldValueStatement);
-        }
-        return setFieldValueStatement;
-    }
-
-    private StatementDef setFieldValue(InjectMethodSignature injectMethodSignature,
-                                       FieldElement fieldElement,
-                                       boolean isOptional,
-                                       TypedElement declaringType,
-                                       boolean requiresReflection) {
-        if (isInnerType(fieldElement.getGenericType())) {
-            return injectField(injectMethodSignature, declaringType, fieldElement, requiresReflection);
-        }
-        if (!isConfigurationProperties || requiresReflection) {
-            boolean isRequired = fieldElement
-                .booleanValue(AnnotationUtil.INJECT, AnnotationUtil.MEMBER_REQUIRED)
-                .orElse(true);
-            return visitFieldInjectionPointInternal(
-                injectMethodSignature,
-                declaringType,
-                fieldElement,
-                requiresReflection,
-                GET_VALUE_FOR_FIELD,
-                isOptional,
-                false,
-                isRequired
-            );
-        }
-        fieldInjectionPoints.add(new FieldVisitData(declaringType, fieldElement, false));
-        int fieldIndex = fieldInjectionPoints.size() - 1;
-        ExpressionDef value;
-        Optional<String> property = fieldElement.getAnnotationMetadata().stringValue(Property.class, "name");
-        if (property.isPresent()) {
-            value = getInvokeGetPropertyValueForField(injectMethodSignature, fieldElement, fieldElement.getAnnotationMetadata(), property.get(), fieldIndex);
-        } else {
-            Optional<String> valueValue = fieldElement.getAnnotationMetadata().stringValue(Value.class);
-            if (valueValue.isPresent()) {
-                value = getInvokeGetPropertyPlaceholderValueForField(injectMethodSignature, fieldElement, valueValue.get(), fieldIndex);
-            } else {
-                // ???
-                value = ExpressionDef.nullValue();
-            }
-        }
-        return injectMethodSignature.instanceVar.field(fieldElement).put(value);
-    }
-
     private StatementDef onBeanInstance(VariableDef.This aThis,
                                         List<VariableDef.MethodParameter> methodParameters,
                                         BuildMethodDefinition buildMethodDefinition,
                                         ExpressionDef beanInstance) {
-        boolean needsInjectMethod = !injectCommands.isEmpty() || !injectedMethods.isEmpty() || superBeanDefinition;
+        boolean needsInjectMethod = hasInjection() || superBeanDefinition;
         boolean needsInjectScope = hasInjectScope(buildMethodDefinition.getParameters());
         boolean needsPostConstruct = needsPostConstruct();
         if (!needsInjectScope && !needsInjectMethod && !needsPostConstruct) {
@@ -1821,6 +1780,10 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
             return StatementDef.multi(statements);
         });
+    }
+
+    private boolean hasInjection() {
+        return !injectCommands.isEmpty() || !injectedMethods.isEmpty() || !injectedFields.isEmpty();
     }
 
     private boolean needsPostConstruct() {
@@ -1916,7 +1879,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return buildCustomInstantiate(aThis, methodParameters, onBeanInstance, customBuildMethodDefinition, values);
         }
         if (constructorDefinition != null) {
-            List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
+            List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.injectionPoints();
             if (!parameters.isEmpty()) {
                 List<? extends ExpressionDef> values = getConstructorArgumentValues2(aThis, methodParameters, parameters, isParametrized, constructorDefSupplier);
                 StatementDef statement = buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorDefinition, values);
@@ -1938,7 +1901,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                                      Function<ExpressionDef, StatementDef> onBeanInstance,
                                                      ConstructorDefinition<ClassElement> constructorDefinition,
                                                      List<? extends ExpressionDef> values) {
-        List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
+        List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.injectionPoints();
         if (isConstructorIntercepted(constructorDefinition.annotationMetadata())) {
             ClassTypeDef factoryInterceptor = createConstructorInterceptor(constructorDefinition);
             return onBeanInstance.apply(
@@ -2044,7 +2007,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             hasValuesExpressions = new ArrayList<>();
             for (int i = 0; i < values.size(); i++) {
                 ExpressionDef value = values.get(i);
-                BeanDefinitionInjectionPoint<ClassElement> parameter = constructorDefinition.parameters().get(i);
+                BeanDefinitionInjectionPoint<ClassElement> parameter = constructorDefinition.injectionPoints().get(i);
                 if (parameter.getAnnotationMetadata().hasAnnotation(Property.class)) {
                     hasValuesExpressions.add(
                         getContainsPropertyCheck(aThis, methodParameters, parameter.type(), parameter.getAnnotationMetadata())
@@ -2059,8 +2022,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             constructorDefinition.owningType(),
             "<init>",
             constructorDefinition.owningType(),
-            constructorDefinition.parameters().stream().map(p -> p.getAnnotationMetadata()).toList(),
-            constructorDefinition.parameters().stream().map(BeanDefinitionInjectionPoint::type).toList(),
+            constructorDefinition.injectionPoints().stream().map(p -> p.getAnnotationMetadata()).toList(),
+            constructorDefinition.injectionPoints().stream().map(BeanDefinitionInjectionPoint::type).toList(),
             false,
             constructorDefinition.requiresReflection(),
             true,
@@ -2156,7 +2119,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         innerClassBuilder.addMethod(
             MethodDef.override(METHOD_BEAN_CONSTRUCTOR_INSTANTIATE)
                 .build((aThis, methodParameters) -> {
-                    List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
+                    List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.injectionPoints();
                     List<ExpressionDef> values = IntStream.range(0, parameters.size())
                         .<ExpressionDef>mapToObj(index -> methodParameters.getFirst().arrayElement(index).cast(TypeDef.erasure(parameters.getFirst().type())))
                         .toList();
@@ -2265,7 +2228,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                     .toList())));
             failStatements.add(beanDefinitionTypeDef.getStaticField(injectionMethodsField).put(ExpressionDef.nullValue()));
         }
-        boolean hasFieldInjection = !fieldInjectionPoints.isEmpty();
+        boolean hasFieldInjection = !allFields.isEmpty();
         if (hasFieldInjection) {
 
             TypeDef.Array fieldReferenceArray = ClassTypeDef.of(AbstractInitializableBeanDefinition.FieldReference.class).array();
@@ -2275,8 +2238,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             classDefBuilder.addField(injectionFieldsField);
 
             initStatements.add(beanDefinitionTypeDef.getStaticField(injectionFieldsField)
-                .put(fieldReferenceArray.instantiate(fieldInjectionPoints.stream()
-                    .map(fd -> getNewFieldReference(fd.beanType, fd.fieldElement))
+                .put(fieldReferenceArray.instantiate(allFields.stream()
+                    .map(fd -> getNewFieldReference(fd.fieldElement().getDeclaringType(), fd.fieldElement()))
                     .toList())));
             failStatements.add(beanDefinitionTypeDef.getStaticField(injectionFieldsField).put(ExpressionDef.nullValue()));
         }
@@ -3044,17 +3007,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         needsInitializeCall = true;
         // for "super bean definitions" we just delegate to super
         if (!superBeanDefinition || isPostConstructIntercepted()) {
-//            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), true, false);
-//            postConstructMethodVisits.add(methodVisitData);
-//            allMethodVisits.add(methodVisitData);
-//            buildMethodDefinition.postConstruct.injectionPoints.add(new
-//                    InjectMethodBuildCommand(
-//                    declaringType,
-//                    methodElement,
-//                    requiresReflection,
-//                    allMethodVisits.size() - 1
-//                )
-//            );
             addPostConstruct(createMethodDefinition(methodElement, methodElement, requiresReflection));
         }
     }
@@ -3067,7 +3019,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return new MethodDefinition<>(
             methodElement,
             annotationMetadata,
-            Arrays.stream(methodElement.getSuspendParameters()).map(this::getInjectionPoint).toList(),
+            Arrays.stream(methodElement.getSuspendParameters()).map(p -> getInjectionPoint(p.getGenericType(), p, p.getName())).toList(),
             requiresReflection
         );
     }
@@ -3079,15 +3031,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                       VisitorContext visitorContext) {
         // for "super bean definitions" we just delegate to super
         if (!superBeanDefinition || isPreDestroyIntercepted()) {
-//            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), false, true);
-//            preDestroyMethodVisits.add(methodVisitData);
-//            allMethodVisits.add(methodVisitData);
-//            buildMethodDefinition.preDestroy.injectionPoints.add(new InjectMethodBuildCommand(
-//                declaringType,
-//                methodElement,
-//                requiresReflection,
-//                allMethodVisits.size() - 1
-//            ));
             addPreDestroy(createMethodDefinition(methodElement, methodElement, requiresReflection));
         }
     }
@@ -3102,16 +3045,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                           boolean requiresReflection,
                                           VisitorContext visitorContext) {
         evaluatedExpressionProcessor.processEvaluatedExpressions(methodElement.getAnnotationMetadata(), this.beanTypeElement);
-//        methodInjectionPoints.add(methodVisitData);
-//        allMethodVisits.add(methodVisitData);
-//        injectCommands.add(new InjectMethodInjectCommand(
-//            declaringType,
-//            methodElement,
-//            requiresReflection,
-//            visitorContext,
-//            allMethodVisits.size() - 1)
-//        );
-
         MethodDefinition<ClassElement, MethodElement> methodDefinition = createMethodDefinition(methodElement, methodElement, requiresReflection);
         addMethodInjection(methodDefinition);
     }
@@ -3223,61 +3156,74 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         FieldElement fieldElement,
         boolean requiresReflection,
         VisitorContext visitorContext) {
-        injectCommands.add(new InjectFieldInjectCommand(declaringType, fieldElement, requiresReflection));
+        addFieldInjection(createFieldDefinition(fieldElement, requiresReflection));
+    }
+
+    private FieldDefinition<ClassElement, FieldElement> createFieldDefinition(FieldElement fieldElement, boolean requiresReflection) {
+        return new FieldDefinition<>(fieldElement, fieldElement, getInjectionPoint(fieldElement.getGenericType(), fieldElement, fieldElement.getName()), requiresReflection, false);
     }
 
     private StatementDef injectField(InjectMethodSignature injectMethodSignature,
-                                     TypedElement declaringType,
-                                     FieldElement fieldElement,
-                                     boolean requiresReflection) {
+                                     FieldDefinition<ClassElement, FieldElement> fieldDefinition) {
 
-        boolean isRequired = fieldElement
+        boolean isRequired = fieldDefinition.annotationMetadata()
             .booleanValue(AnnotationUtil.INJECT, AnnotationUtil.MEMBER_REQUIRED)
             .orElse(true);
-        boolean requiresGenericType = false;
-        Method methodToInvoke;
-        final ClassElement genericType = fieldElement.getGenericType();
+        FieldElement fieldElement = fieldDefinition.fieldElement();
+        ClassElement genericType = fieldElement.getGenericType();
         boolean isArray = genericType.isArray();
-        boolean isCollection = genericType.isAssignable(Collection.class);
-        boolean isMap = isInjectableMap(genericType);
-        if (isMap) {
-            requiresGenericType = true;
-            methodToInvoke = GET_MAP_OF_TYPE_FOR_FIELD;
-        } else if (isCollection || isArray) {
-            requiresGenericType = true;
-            ClassElement typeArgument = genericType.isArray() ? genericType.fromArray() : genericType.getFirstTypeArgument().orElse(null);
-            if (typeArgument != null && !typeArgument.isPrimitive()) {
-                if (typeArgument.isAssignable(BeanRegistration.class)) {
-                    methodToInvoke = GET_BEAN_REGISTRATIONS_FOR_FIELD;
-                } else {
-                    methodToInvoke = GET_BEANS_OF_TYPE_FOR_FIELD;
+
+        int fieldIndex = allFields.indexOf(fieldDefinition);
+
+        evaluatedExpressionProcessor.processEvaluatedExpressions(fieldElement.getAnnotationMetadata(), null);
+
+        autoApplyNamedIfPresent(fieldElement, fieldElement.getAnnotationMetadata());
+
+        ExpressionDef valueExpression = getValueBypassingBeanContext(fieldElement.getGenericField(), injectMethodSignature.methodParameters);
+        if (valueExpression == null) {
+            valueExpression = switch (fieldDefinition.injectionPoint()) {
+                case BeanRegistrationInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_BEAN_REGISTRATION_FOR_FIELD, isArray, true, fieldIndex);
+
+                case BeanRegistrationsInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_BEAN_REGISTRATIONS_FOR_FIELD, isArray, true, fieldIndex);
+
+                case BeansInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_BEANS_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
+
+                case MapOfBeansInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_MAP_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
+
+                case OptionalBeanInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, FIND_BEAN_FOR_FIELD, isArray, true, fieldIndex);
+
+                case StreamOfBeansInjectionPoint<ClassElement> v ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_STREAM_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
+
+                case ParameterInjectionPoint<ClassElement> v -> {
+                    throw new IllegalArgumentException("Field injection doesn't support @Parameter");
                 }
-            } else {
-                requiresGenericType = false;
-                methodToInvoke = GET_BEAN_FOR_FIELD;
-            }
-        } else if (genericType.isAssignable(Stream.class)) {
-            requiresGenericType = true;
-            methodToInvoke = GET_STREAM_OF_TYPE_FOR_FIELD;
-        } else if (genericType.isAssignable(Optional.class)) {
-            requiresGenericType = true;
-            methodToInvoke = FIND_BEAN_FOR_FIELD;
-        } else if (genericType.isAssignable(BeanRegistration.class)) {
-            requiresGenericType = true;
-            methodToInvoke = GET_BEAN_REGISTRATION_FOR_FIELD;
-        } else {
-            methodToInvoke = GET_BEAN_FOR_FIELD;
+                case PropertyInjectionPoint<ClassElement> v ->
+                    getInvokeGetPropertyValueForField(injectMethodSignature, fieldElement, fieldElement.getAnnotationMetadata(), v.value(), fieldIndex);
+
+                case ValueInjectionPoint<ClassElement> v -> {
+                    if (v.hasExpression()) {
+                        yield resolveFieldValue(injectMethodSignature, fieldElement, GET_VALUE_FOR_FIELD, isArray, false, fieldIndex);
+                    }
+                    yield getInvokeGetPropertyPlaceholderValueForField(injectMethodSignature, fieldElement, v.value(), fieldIndex);
+                }
+                default ->
+                    resolveFieldValue(injectMethodSignature, fieldElement, GET_BEAN_FOR_FIELD, isArray, false, fieldIndex);
+            };
         }
-        return visitFieldInjectionPointInternal(
-            injectMethodSignature,
-            declaringType,
-            fieldElement,
-            requiresReflection,
-            methodToInvoke,
-            isArray,
-            requiresGenericType,
-            isRequired
-        );
+
+        if (!isRequired) {
+            return valueExpression.newLocal(fieldElement.getName() + "Value", valueVar ->
+                valueVar.ifNonNull(
+                    putField(fieldElement, fieldDefinition.requiresReflection(), injectMethodSignature, valueVar, fieldIndex)
+                ));
+        }
+        return putField(fieldElement, fieldDefinition.requiresReflection(), injectMethodSignature, valueExpression, fieldIndex);
     }
 
     private static boolean isInjectableMap(ClassElement genericType) {
@@ -3346,7 +3292,24 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                 FieldElement fieldElement,
                                 boolean requiresReflection,
                                 boolean isOptional) {
-        injectCommands.add(new InjectFieldValueInjectCommand(declaringType, fieldElement, requiresReflection, isOptional));
+        FieldDefinition<ClassElement, FieldElement> fieldDefinition;
+        if (isInnerType(fieldElement.getGenericType())) {
+            fieldDefinition = new FieldDefinition<>(fieldElement, fieldElement,
+                getInjectionPoint(fieldElement.getGenericType(), fieldElement.getAnnotationMetadata(), fieldElement.getName()),
+                requiresReflection,
+                isOptional
+            );
+        } else if (!isConfigurationProperties || requiresReflection) {
+            BeanDefinitionInjectionPoint<ClassElement> injectionPoint = createPropertyOrValueInjectionPoint(fieldElement.getGenericType(), fieldElement, fieldElement.getName());
+            if (injectionPoint == null) {
+                throw new IllegalStateException("Expected a property or a value");
+            }
+            fieldDefinition = new FieldDefinition<>(fieldElement, fieldElement, injectionPoint, requiresReflection, isOptional);
+        } else {
+            PropertyInjectionPoint<ClassElement> fjp = createPropertyInjection(fieldElement.getGenericType(), fieldElement, fieldElement.getName());
+            fieldDefinition = new FieldDefinition<>(fieldElement, fieldElement, fjp, requiresReflection, isOptional);
+        }
+        addFieldInjection(fieldDefinition);
     }
 
     private ExpressionDef getInvokeGetPropertyValueForField(InjectMethodSignature injectMethodSignature,
@@ -3437,55 +3400,31 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return null;
     }
 
-    private StatementDef visitFieldInjectionPointInternal(InjectMethodSignature injectMethodSignature,
-                                                          TypedElement declaringType,
-                                                          FieldElement fieldElement,
-                                                          boolean requiresReflection,
-                                                          Method methodToInvoke,
-                                                          boolean isArray,
-                                                          boolean requiresGenericType,
-                                                          boolean isRequired) {
-        evaluatedExpressionProcessor.processEvaluatedExpressions(fieldElement.getAnnotationMetadata(), null);
-
-        autoApplyNamedIfPresent(fieldElement, fieldElement.getAnnotationMetadata());
-
-        fieldInjectionPoints.add(new FieldVisitData(declaringType, fieldElement, requiresReflection));
-
-        int fieldIndex = fieldInjectionPoints.size() - 1;
-
-        ExpressionDef valueExpression = getValueBypassingBeanContext(fieldElement.getGenericField(), injectMethodSignature.methodParameters);
-        if (valueExpression == null) {
-            List<ExpressionDef> valueExpressions = new ArrayList<>(
-                List.of(
-                    injectMethodSignature.beanResolutionContext,
-                    injectMethodSignature.beanContext,
-                    ExpressionDef.constant(fieldIndex)
-                )
-            );
-            if (requiresGenericType) {
-                valueExpressions.add(
-                    resolveFieldArgumentGenericType(fieldElement.getGenericType(), fieldIndex)
-                );
-            }
+    private ExpressionDef resolveFieldValue(InjectMethodSignature injectMethodSignature, FieldElement fieldElement, Method methodToInvoke, boolean isArray, boolean requiresGenericType, int fieldIndex) {
+        ExpressionDef valueExpression;
+        List<ExpressionDef> valueExpressions = new ArrayList<>(
+            List.of(
+                injectMethodSignature.beanResolutionContext,
+                injectMethodSignature.beanContext,
+                ExpressionDef.constant(fieldIndex)
+            )
+        );
+        if (requiresGenericType) {
             valueExpressions.add(
-                getQualifier(fieldElement, resolveFieldArgument(fieldIndex))
+                resolveFieldArgumentGenericType(fieldElement.getGenericType(), fieldIndex)
             );
-            valueExpression = injectMethodSignature.aThis
-                .invoke(methodToInvoke, valueExpressions);
-
-            if (isArray && requiresGenericType) {
-                valueExpression = convertToArray(fieldElement.getType().fromArray(), valueExpression);
-            }
-            valueExpression = valueExpression.cast(TypeDef.erasure(fieldElement.getType()));
         }
+        valueExpressions.add(
+            getQualifier(fieldElement, resolveFieldArgument(fieldIndex))
+        );
+        valueExpression = injectMethodSignature.aThis
+            .invoke(methodToInvoke, valueExpressions);
 
-        if (!isRequired) {
-            return valueExpression.newLocal(fieldElement.getName() + "Value", valueVar ->
-                valueVar.ifNonNull(
-                    putField(fieldElement, requiresReflection, injectMethodSignature, valueVar, fieldIndex)
-                ));
+        if (isArray && requiresGenericType) {
+            valueExpression = convertToArray(fieldElement.getType().fromArray(), valueExpression);
         }
-        return putField(fieldElement, requiresReflection, injectMethodSignature, valueExpression, fieldIndex);
+        valueExpression = valueExpression.cast(TypeDef.erasure(fieldElement.getType()));
+        return valueExpression;
     }
 
     private StatementDef putField(FieldElement fieldElement,
@@ -3705,7 +3644,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
 
         applyDefaultNamedToParameters(List.of(methodDefinition.methodElement().getParameters()));
-        for (BeanDefinitionInjectionPoint<ClassElement> value : methodDefinition.parameters()) {
+        for (BeanDefinitionInjectionPoint<ClassElement> value : methodDefinition.injectionPoints()) {
             evaluatedExpressionProcessor.processEvaluatedExpressions(value.getAnnotationMetadata(), null);
         }
 
@@ -3718,15 +3657,15 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                          VariableDef instanceVar,
                                          int methodIndex) {
         boolean isRequiredInjection = InjectionPoint.isInjectionRequired(methodDefinition.annotationMetadata());
-        List<ExpressionDef> invocationValues = injectMethodValues(aThis, parameters, methodDefinition.parameters(), methodIndex);
+        List<ExpressionDef> invocationValues = injectMethodValues(aThis, parameters, methodDefinition.injectionPoints(), methodIndex);
         MethodElement methodElement = methodDefinition.methodElement();
         if (!isRequiredInjection && methodElement.hasParameters()) {
             // store parameter values in local object[]
 
             return TypeDef.OBJECT.array().instantiate(invocationValues).newLocal("values", valuesVar -> {
                 // invoke isMethodResolved with method parameters
-                List<? extends ExpressionDef> values = IntStream.range(0, methodDefinition.parameters().size())
-                    .mapToObj(index -> valuesVar.arrayElement(index).cast(TypeDef.erasure(methodDefinition.parameters().get(index).type())))
+                List<? extends ExpressionDef> values = IntStream.range(0, methodDefinition.injectionPoints().size())
+                    .mapToObj(index -> valuesVar.arrayElement(index).cast(TypeDef.erasure(methodDefinition.injectionPoints().get(index).type())))
                     .toList();
 
                 return aThis.invoke(
@@ -5219,12 +5158,12 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     @Override
     public Collection<Element> getInjectionPoints() {
-        if (fieldInjectionPoints.isEmpty() && allMethods.isEmpty()) {
+        if (allFields.isEmpty() && allMethods.isEmpty()) {
             return Collections.emptyList();
         } else {
             Collection<Element> injectionPoints = new ArrayList<>();
-            for (FieldVisitData fieldInjectionPoint : fieldInjectionPoints) {
-                injectionPoints.add(fieldInjectionPoint.fieldElement);
+            for (FieldDefinition<ClassElement, FieldElement> fieldInjectionPoint : allFields) {
+                injectionPoints.add(fieldInjectionPoint.fieldElement());
             }
             for (MethodDefinition<ClassElement, MethodElement> methodInjectionPoint : allMethods) {
                 injectionPoints.add(methodInjectionPoint.methodElement());
@@ -5600,19 +5539,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     }
 
-    private record InjectMethodInjectCommand(TypedElement declaringType,
-                                             MethodElement methodElement,
-                                             boolean requiresReflection,
-                                             VisitorContext visitorContext,
-                                             int methodIndex) implements InjectMethodCommand {
-
-        @Override
-        public boolean hasInjectScope() {
-            return BeanDefinitionWriter.hasInjectScope(methodElement.getParameters());
-        }
-
-    }
-
     private record ConfigBuilderInjectCommand(
         ConfigurationBuilderDefinition configurationBuilderDefinition) implements InjectMethodCommand {
         @Override
@@ -5621,35 +5547,10 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         }
     }
 
-    private record InjectFieldInjectCommand(TypedElement declaringType,
-                                            FieldElement fieldElement,
-                                            boolean requiresReflection) implements InjectMethodCommand {
-
-        @Override
-        public boolean hasInjectScope() {
-            return BeanDefinitionWriter.hasInjectScope(fieldElement);
-        }
-    }
-
-    private record InjectFieldValueInjectCommand(TypedElement declaringType,
-                                                 FieldElement fieldElement,
-                                                 boolean requiresReflection,
-                                                 boolean isOptional) implements InjectMethodCommand {
-
-        @Override
-        public boolean hasInjectScope() {
-            return BeanDefinitionWriter.hasInjectScope(fieldElement);
-        }
-    }
-
     private interface InjectMethodCommand {
 
         boolean hasInjectScope();
 
-    }
-
-    private record InjectMethodBuildCommand(TypedElement declaringType, MethodElement methodElement,
-                                            boolean requiresReflection, int methodIndex) {
     }
 
     private record InjectMethodSignature(
