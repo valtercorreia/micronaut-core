@@ -1550,7 +1550,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                             injectMethodSignature.aThis,
                             injectMethodSignature.methodParameters,
                             injectMethodSignature.instanceVar,
-                            allMethods.indexOf(injectedMethod)
+                            allMethods.indexOf(injectedMethod),
+                            injectedMethod
                         ));
                         hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(methodElement.getParameters());
                     }
@@ -2994,7 +2995,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 injectMethodSignature.aThis,
                 injectMethodSignature.methodParameters,
                 injectMethodSignature.instanceVar,
-                allMethods.indexOf(methodDefinition)
+                allMethods.indexOf(methodDefinition),
+                methodDefinition
             );
         }
     }
@@ -3624,7 +3626,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                       VariableDef.This aThis,
                                       List<VariableDef.MethodParameter> parameters,
                                       VariableDef instanceVar,
-                                      int methodIndex) {
+                                      int methodIndex,
+                                      MethodDefinition<ClassElement, MethodElement> methodDefinition) {
 
 
         final List<ParameterElement> argumentTypes = Arrays.asList(methodElement.getParameters());
@@ -3633,7 +3636,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             evaluatedExpressionProcessor.processEvaluatedExpressions(value.getAnnotationMetadata(), null);
         }
 
-        return injectStatement(aThis, parameters, methodElement, requiresReflection, instanceVar, methodIndex);
+        return injectStatement(aThis, parameters, methodElement, requiresReflection, instanceVar, methodIndex, methodDefinition);
     }
 
     private StatementDef executeInjectMethod(VariableDef.This aThis,
@@ -3698,12 +3701,18 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                          MethodElement methodElement,
                                          boolean requiresReflection,
                                          VariableDef instanceVar,
-                                         int methodIndex) {
+                                         int methodIndex,
+                                         MethodDefinition<ClassElement, MethodElement> methodDefinition) {
         final List<ParameterElement> argumentTypes = Arrays.asList(methodElement.getParameters());
         boolean isRequiredInjection = InjectionPoint.isInjectionRequired(methodElement);
-        List<ExpressionDef> invocationValues = IntStream.range(0, argumentTypes.size())
-            .mapToObj(index -> getBeanForMethodParameter(aThis, parameters, index, argumentTypes.get(index), methodIndex))
-            .toList();
+        List<BeanDefinitionInjectionPoint<ClassElement>> injectionPoints = methodDefinition.injectionPoints();
+        List<ExpressionDef> invocationValues = new ArrayList<>(injectionPoints.size());
+        for (int parameterIndex = 0; parameterIndex < injectionPoints.size(); parameterIndex++) {
+            BeanDefinitionInjectionPoint<ClassElement> ip = injectionPoints.get(parameterIndex);
+            invocationValues.add(
+                injectMethodParameterExpression(aThis, parameters, methodIndex, parameterIndex, ip)
+            );
+        }
         if (!isRequiredInjection && methodElement.hasParameters()) {
             // store parameter values in local object[]
 
@@ -3740,70 +3749,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private StatementDef destroyInjectScopeBeansIfNecessary(List<VariableDef.MethodParameter> parameters) {
         return parameters.getFirst().invoke(DESTROY_INJECT_SCOPED_BEANS_METHOD);
-    }
-
-    private ExpressionDef getBeanForMethodParameter(VariableDef.This aThis,
-                                                    List<VariableDef.MethodParameter> methodParameters,
-                                                    int i,
-                                                    ParameterElement entry,
-                                                    int methodIndex) {
-        AnnotationMetadata argMetadata = entry.getAnnotationMetadata();
-        ExpressionDef expressionDef = getValueBypassingBeanContext(entry.getGenericType(), methodParameters);
-        if (expressionDef != null) {
-            return expressionDef;
-        }
-        boolean requiresGenericType = false;
-        final ClassElement genericType = entry.getGenericType();
-        Method methodToInvoke;
-        boolean isCollection = genericType.isAssignable(Collection.class);
-        boolean isMap = isInjectableMap(genericType);
-        boolean isArray = genericType.isArray();
-
-        if (isValueType(argMetadata) && !isInnerType(entry.getGenericType())) {
-            Optional<String> property = argMetadata.stringValue(Property.class, "name");
-            if (property.isPresent()) {
-                return getInvokeGetPropertyValueForMethod(aThis, methodParameters, methodIndex, i, entry.getName(), entry.getType(), property.get());
-            } else {
-                if (entry.getAnnotationMetadata().getValue(Value.class, EvaluatedExpressionReference.class).isPresent()) {
-                    return getInvokeGetEvaluatedExpressionValueForMethodArgument(aThis, methodIndex, i, entry.getType());
-                } else {
-                    Optional<String> valueValue = entry.getAnnotationMetadata().stringValue(Value.class);
-                    if (valueValue.isPresent()) {
-                        return getInvokeGetPropertyPlaceholderValueForMethod(aThis, methodParameters, methodIndex, i, entry.getType(), valueValue.get());
-                    }
-                }
-                return ExpressionDef.nullValue();
-            }
-        } else if (isCollection || isArray) {
-            requiresGenericType = true;
-            ClassElement typeArgument = genericType.isArray() ? genericType.fromArray() : genericType.getFirstTypeArgument().orElse(null);
-            if (typeArgument != null && !typeArgument.isPrimitive()) {
-                if (typeArgument.isAssignable(BeanRegistration.class)) {
-                    methodToInvoke = GET_BEAN_REGISTRATIONS_FOR_METHOD_ARGUMENT;
-                } else {
-                    methodToInvoke = GET_BEANS_OF_TYPE_FOR_METHOD_ARGUMENT;
-                }
-            } else {
-                methodToInvoke = GET_BEAN_FOR_METHOD_ARGUMENT;
-                requiresGenericType = false;
-            }
-        } else if (isMap) {
-            requiresGenericType = true;
-            methodToInvoke = GET_MAP_OF_TYPE_FOR_METHOD_ARGUMENT;
-        } else if (genericType.isAssignable(Stream.class)) {
-            requiresGenericType = true;
-            methodToInvoke = GET_STREAM_OF_TYPE_FOR_METHOD_ARGUMENT;
-        } else if (genericType.isAssignable(Optional.class)) {
-            requiresGenericType = true;
-            methodToInvoke = FIND_BEAN_FOR_METHOD_ARGUMENT;
-        } else if (genericType.isAssignable(BeanRegistration.class)) {
-            requiresGenericType = true;
-            methodToInvoke = GET_BEAN_REGISTRATION_FOR_METHOD_ARGUMENT;
-        } else {
-            methodToInvoke = GET_BEAN_FOR_METHOD_ARGUMENT;
-        }
-
-        return injectMethodParameter(methodToInvoke, requiresGenericType, genericType, aThis, methodParameters, methodIndex, i, entry);
     }
 
     private ExpressionDef.Cast injectMethodParameter(Method methodToInvoke,
