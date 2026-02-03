@@ -685,8 +685,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     @Nullable
     private Set<ClassElement> exposes;
     private final List<FieldVisitData> fieldInjectionPoints = new ArrayList<>(2);
-    private final List<MethodVisitData> methodInjectionPoints = new ArrayList<>(2);
-    private final List<MethodVisitData> allMethodVisits = new ArrayList<>(2);
     private final Map<ClassElement, List<AnnotationVisitData>> annotationInjectionPoints = new LinkedHashMap<>(2);
     private final Map<String, Boolean> isLifeCycleCache = new HashMap<>(2);
     private ExecutableMethodsDefinitionWriter executableMethodsDefinitionWriter;
@@ -710,6 +708,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private final Function<String, ExpressionDef> loadClassValueExpressionFn;
 
+    private final List<MethodDefinition<ClassElement, MethodElement>> allMethods = new ArrayList<>();
+    private final List<MethodDefinition<ClassElement, MethodElement>> injectedMethods = new ArrayList<>();
     public final List<MethodDefinition<ClassElement, MethodElement>> postConstructMethods = new ArrayList<>();
     private final List<MethodDefinition<ClassElement, MethodElement>> preDestroyMethods = new ArrayList<>();
     private ConstructorDefinition<ClassElement> constructorDefinition;
@@ -900,12 +900,20 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     @Override
     public void addPostConstruct(MethodDefinition<ClassElement, MethodElement> methodDefinition) {
+        allMethods.add(methodDefinition);
         postConstructMethods.add(methodDefinition);
     }
 
     @Override
     public void addPreDestroy(MethodDefinition<ClassElement, MethodElement> methodDefinition) {
+        allMethods.add(methodDefinition);
         preDestroyMethods.add(methodDefinition);
+    }
+
+    @Override
+    public void addMethodInjection(MethodDefinition<ClassElement, MethodElement> methodDefinition) {
+        allMethods.add(methodDefinition);
+        injectedMethods.add(methodDefinition);
     }
 
     /**
@@ -1347,7 +1355,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         classDefBuilder.addMethod(
             getBuildMethod(buildMethodDefinition)
         );
-        if (!injectCommands.isEmpty()) {
+        if (!injectCommands.isEmpty() || !injectedMethods.isEmpty()) {
             classDefBuilder.addMethod(
                 getInjectMethod(injectCommands)
             );
@@ -1509,6 +1517,19 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                         statements.add(getInjectStatement(injectCommand, injectMethodSignature));
                         hasInjectPoint |= injectCommand.hasInjectScope();
                     }
+                    for (MethodDefinition<ClassElement, MethodElement> injectedMethod : injectedMethods) {
+                        MethodElement methodElement = injectedMethod.methodElement();
+                        statements.add(injectMethod(
+                            methodElement,
+                            injectedMethod.requiresReflection(),
+                            injectMethodSignature.aThis,
+                            injectMethodSignature.methodParameters,
+                            injectMethodSignature.instanceVar,
+                            allMethods.indexOf(injectedMethod)
+                        ));
+                        hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(methodElement.getParameters());
+                    }
+
                     List<StatementDef> returnStatements = new ArrayList<>();
                     if (hasInjectPoint) {
                         returnStatements.add(destroyInjectScopeBeansIfNecessary(methodParameters));
@@ -1767,7 +1788,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                         List<VariableDef.MethodParameter> methodParameters,
                                         BuildMethodDefinition buildMethodDefinition,
                                         ExpressionDef beanInstance) {
-        boolean needsInjectMethod = !injectCommands.isEmpty() || superBeanDefinition;
+        boolean needsInjectMethod = !injectCommands.isEmpty() || !injectedMethods.isEmpty() || superBeanDefinition;
         boolean needsInjectScope = hasInjectScope(buildMethodDefinition.getParameters());
         boolean needsPostConstruct = needsPostConstruct();
         if (!needsInjectScope && !needsInjectMethod && !needsPostConstruct) {
@@ -1825,9 +1846,9 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return aThis.invoke(superMethod, methodParameters).cast(beanTypeDef).newLocal("beanInstance", beanInstance -> {
                 List<StatementDef> statements = new ArrayList<>();
                 boolean hasInjectScope = false;
-                int index = 0;
                 for (MethodDefinition<ClassElement, MethodElement> lifecycleMethod : lifecycleMethods) {
-                    statements.add(executeInjectMethod(aThis, methodParameters, beanInstance, index++, lifecycleMethod));
+                    int methodIndex = allMethods.indexOf(lifecycleMethod);
+                    statements.add(executeInjectMethod(aThis, methodParameters, beanInstance, methodIndex, lifecycleMethod));
                     if (!hasInjectScope) {
                         for (ParameterElement parameter : lifecycleMethod.methodElement().getSuspendParameters()) {
                             if (hasInjectScope(parameter)) {
@@ -2228,7 +2249,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         FieldDef typeArgumentsField = null;
         FieldDef executableMethodsField = null;
 
-        boolean hasMethodInjection = !superBeanDefinition && !allMethodVisits.isEmpty();
+        boolean hasMethodInjection = !superBeanDefinition && !allMethods.isEmpty();
         if (hasMethodInjection) {
 
             TypeDef.Array methodReferenceArray = ClassTypeDef.of(AbstractInitializableBeanDefinition.MethodReference.class).array();
@@ -2238,8 +2259,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
             classDefBuilder.addField(injectionMethodsField);
             initStatements.add(beanDefinitionTypeDef.getStaticField(injectionMethodsField)
-                .put(methodReferenceArray.instantiate(allMethodVisits.stream()
-                    .map(md -> getNewMethodReference(md.beanType, md.methodElement, md.annotationMetadata, md.postConstruct, md.preDestroy))
+                .put(methodReferenceArray.instantiate(allMethods.stream()
+                    .map(md -> getNewMethodReference(md.methodElement().getDeclaringType(), md.methodElement(), md.annotationMetadata(), postConstructMethods.contains(md), preDestroyMethods.contains(md)))
                     .toList())));
             failStatements.add(beanDefinitionTypeDef.getStaticField(injectionMethodsField).put(ExpressionDef.nullValue()));
         }
@@ -2929,12 +2950,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                         AnnotationMetadata annotationMetadata,
                                         boolean requiresReflection,
                                         boolean isOptional) {
+        MethodDefinition<ClassElement, MethodElement> methodDefinition = createMethodDefinition(methodElement, annotationMetadata, requiresReflection);
 
         if (!requiresReflection) {
 
             ParameterElement parameter = methodElement.getParameters()[0];
 
-            StatementDef setValueStatement = setSetterValue(injectMethodSignature, declaringType, methodElement, annotationMetadata, parameter);
+            StatementDef setValueStatement = setSetterValue(methodDefinition, injectMethodSignature, declaringType, methodElement, annotationMetadata, parameter);
             if (isOptional) {
                 return getPropertyContainsCheck(
                     injectMethodSignature,
@@ -2945,17 +2967,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
             return setValueStatement;
         }
-        final MethodVisitData methodVisitData = new MethodVisitData(
-            declaringType,
-            methodElement,
-            false,
-            annotationMetadata);
-        methodInjectionPoints.add(methodVisitData);
-        allMethodVisits.add(methodVisitData);
+//        addMethodInjection(methodDefinition);
+        allMethods.add(methodDefinition);
         return StatementDef.multi();
     }
 
-    private StatementDef setSetterValue(InjectMethodSignature injectMethodSignature,
+    private StatementDef setSetterValue(MethodDefinition<ClassElement, MethodElement> methodDefinition,
+                                        InjectMethodSignature injectMethodSignature,
                                         TypedElement declaringType,
                                         MethodElement methodElement,
                                         AnnotationMetadata annotationMetadata,
@@ -2965,14 +2983,9 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
             int methodIndex = -1;
             if (keepConfPropInjectPoints) {
-                final MethodVisitData methodVisitData = new MethodVisitData(
-                    declaringType,
-                    methodElement,
-                    false,
-                    annotationMetadata);
-                methodInjectionPoints.add(methodVisitData);
-                allMethodVisits.add(methodVisitData);
-                methodIndex = allMethodVisits.size() - 1;
+//                addMethodInjection(methodDefinition);
+                allMethods.add(methodDefinition);
+                methodIndex = allMethods.indexOf(methodDefinition);
             }
 
             Function<ExpressionDef, StatementDef> onValue = value -> injectMethodSignature
@@ -3008,20 +3021,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
             throw new IllegalStateException();
         } else {
-            final MethodVisitData methodVisitData = new MethodVisitData(
-                declaringType,
-                methodElement,
-                false,
-                annotationMetadata);
-            methodInjectionPoints.add(methodVisitData);
-            allMethodVisits.add(methodVisitData);
+//            addMethodInjection(methodDefinition);
+            allMethods.add(methodDefinition);
+
             return injectMethod(
                 methodElement,
                 false,
                 injectMethodSignature.aThis,
                 injectMethodSignature.methodParameters,
                 injectMethodSignature.instanceVar,
-                allMethodVisits.size() - 1
+                allMethods.indexOf(methodDefinition)
             );
         }
     }
@@ -3033,9 +3042,9 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                          VisitorContext visitorContext) {
         // for "super bean definitions" we just delegate to super
         if (!superBeanDefinition || isPostConstructIntercepted()) {
-            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), true, false);
+//            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), true, false);
 //            postConstructMethodVisits.add(methodVisitData);
-            allMethodVisits.add(methodVisitData);
+//            allMethodVisits.add(methodVisitData);
 //            buildMethodDefinition.postConstruct.injectionPoints.add(new
 //                    InjectMethodBuildCommand(
 //                    declaringType,
@@ -3044,7 +3053,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 //                    allMethodVisits.size() - 1
 //                )
 //            );
-            addPostConstruct(createMethodDefinition(methodElement, requiresReflection));
+            addPostConstruct(createMethodDefinition(methodElement, methodElement, requiresReflection));
         }
     }
 
@@ -3052,10 +3061,10 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return isInterceptedLifeCycleByType(this.annotationMetadata, "POST_CONSTRUCT");
     }
 
-    private MethodDefinition<ClassElement, MethodElement> createMethodDefinition(MethodElement methodElement, boolean requiresReflection) {
+    private MethodDefinition<ClassElement, MethodElement> createMethodDefinition(MethodElement methodElement, AnnotationMetadata annotationMetadata, boolean requiresReflection) {
         return new MethodDefinition<>(
             methodElement,
-            methodElement,
+            annotationMetadata,
             Arrays.stream(methodElement.getSuspendParameters()).map(this::getInjectionPoint).toList(),
             requiresReflection
         );
@@ -3068,16 +3077,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                       VisitorContext visitorContext) {
         // for "super bean definitions" we just delegate to super
         if (!superBeanDefinition || isPreDestroyIntercepted()) {
-            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), false, true);
+//            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), false, true);
 //            preDestroyMethodVisits.add(methodVisitData);
-            allMethodVisits.add(methodVisitData);
+//            allMethodVisits.add(methodVisitData);
 //            buildMethodDefinition.preDestroy.injectionPoints.add(new InjectMethodBuildCommand(
 //                declaringType,
 //                methodElement,
 //                requiresReflection,
 //                allMethodVisits.size() - 1
 //            ));
-            addPreDestroy(createMethodDefinition(methodElement, requiresReflection));
+            addPreDestroy(createMethodDefinition(methodElement, methodElement, requiresReflection));
         }
     }
 
@@ -3090,17 +3099,19 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                           MethodElement methodElement,
                                           boolean requiresReflection,
                                           VisitorContext visitorContext) {
-        MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata());
         evaluatedExpressionProcessor.processEvaluatedExpressions(methodElement.getAnnotationMetadata(), this.beanTypeElement);
-        methodInjectionPoints.add(methodVisitData);
-        allMethodVisits.add(methodVisitData);
-        injectCommands.add(new InjectMethodInjectCommand(
-            declaringType,
-            methodElement,
-            requiresReflection,
-            visitorContext,
-            allMethodVisits.size() - 1)
-        );
+//        methodInjectionPoints.add(methodVisitData);
+//        allMethodVisits.add(methodVisitData);
+//        injectCommands.add(new InjectMethodInjectCommand(
+//            declaringType,
+//            methodElement,
+//            requiresReflection,
+//            visitorContext,
+//            allMethodVisits.size() - 1)
+//        );
+
+        MethodDefinition<ClassElement, MethodElement> methodDefinition = createMethodDefinition(methodElement, methodElement, requiresReflection);
+        addMethodInjection(methodDefinition);
     }
 
     @Override
@@ -5206,15 +5217,15 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     @Override
     public Collection<Element> getInjectionPoints() {
-        if (fieldInjectionPoints.isEmpty() && methodInjectionPoints.isEmpty()) {
+        if (fieldInjectionPoints.isEmpty() && allMethods.isEmpty()) {
             return Collections.emptyList();
         } else {
             Collection<Element> injectionPoints = new ArrayList<>();
             for (FieldVisitData fieldInjectionPoint : fieldInjectionPoints) {
                 injectionPoints.add(fieldInjectionPoint.fieldElement);
             }
-            for (MethodVisitData methodInjectionPoint : methodInjectionPoints) {
-                injectionPoints.add(methodInjectionPoint.methodElement);
+            for (MethodDefinition<ClassElement, MethodElement> methodInjectionPoint : allMethods) {
+                injectionPoints.add(methodInjectionPoint.methodElement());
             }
             return Collections.unmodifiableCollection(injectionPoints);
         }

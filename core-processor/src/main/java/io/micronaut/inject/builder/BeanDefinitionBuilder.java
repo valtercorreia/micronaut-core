@@ -8,6 +8,8 @@ public interface BeanDefinitionBuilder<T, M> {
 
     void constructor(ConstructorDefinition<T> constructorDefinition);
 
+    void addMethodInjection(MethodDefinition<T, M> methodDefinition);
+
     void addPostConstruct(MethodDefinition<T, M> methodDefinition);
 
     void addPreDestroy(MethodDefinition<T, M> methodDefinition);
