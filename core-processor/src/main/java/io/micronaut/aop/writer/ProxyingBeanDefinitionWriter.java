@@ -444,12 +444,14 @@ public abstract class ProxyingBeanDefinitionWriter implements ProxyingBeanDefini
         MethodElement methodElement,
         boolean requiresReflection,
         VisitorContext visitorContext) {
-        proxyBeanDefinitionWriter.visitPostConstructMethod(
-            declaringType,
-            methodElement,
-            requiresReflection,
-            visitorContext
-        );
+        deferredInjectionPoints.add(() -> {
+            proxyBeanDefinitionWriter.visitPostConstructMethod(
+                declaringType,
+                methodElement,
+                requiresReflection,
+                visitorContext
+            );
+        });
     }
 
     @Override
@@ -458,11 +460,13 @@ public abstract class ProxyingBeanDefinitionWriter implements ProxyingBeanDefini
         MethodElement methodElement,
         boolean requiresReflection,
         VisitorContext visitorContext) {
-        proxyBeanDefinitionWriter.visitPreDestroyMethod(
-            declaringType,
-            methodElement,
-            requiresReflection,
-            visitorContext);
+        deferredInjectionPoints.add(() ->
+            proxyBeanDefinitionWriter.visitPreDestroyMethod(
+                declaringType,
+                methodElement,
+                requiresReflection,
+                visitorContext)
+        );
     }
 
     @Override

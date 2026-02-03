@@ -676,6 +676,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private ClassTypeDef superType = TYPE_ABSTRACT_BEAN_DEFINITION_AND_REFERENCE;
     private boolean superBeanDefinition = false;
+    private boolean needsInitializeCall = false;
     private boolean isSuperFactory = false;
     private final AnnotationMetadata annotationMetadata;
     private boolean preprocessMethods = false;
@@ -1823,7 +1824,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     }
 
     private boolean needsPostConstruct() {
-        return !postConstructMethods.isEmpty() || isPostConstructIntercepted();
+        return !postConstructMethods.isEmpty() || isPostConstructIntercepted() || needsInitializeCall;
     }
 
     private boolean needsPreDestroy() {
@@ -1909,6 +1910,11 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
             return buildFactoryGet(aThis, methodParameters, onBeanInstance, factoryBuildMethodDefinition, List.of());
         }
+        if (buildMethodDefinition instanceof CustomBuildMethodDefinition customBuildMethodDefinition) {
+            List<? extends ExpressionDef> values = getConstructorArgumentValues(aThis, methodParameters,
+                List.of(buildMethodDefinition.getParameters()), isParametrized, constructorDefSupplier);
+            return buildCustomInstantiate(aThis, methodParameters, onBeanInstance, customBuildMethodDefinition, values);
+        }
         if (constructorDefinition != null) {
             List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
             if (!parameters.isEmpty()) {
@@ -1923,11 +1929,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 return statement;
             }
             return buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorDefinition, List.of());
-        }
-        if (buildMethodDefinition instanceof CustomBuildMethodDefinition customBuildMethodDefinition) {
-            List<? extends ExpressionDef> values = getConstructorArgumentValues(aThis, methodParameters,
-                List.of(buildMethodDefinition.getParameters()), isParametrized, constructorDefSupplier);
-            return buildCustomInstantiate(aThis, methodParameters, onBeanInstance, customBuildMethodDefinition, values);
         }
         throw new IllegalStateException("Unknown build method definition: " + buildMethodDefinition);
     }
@@ -3040,6 +3041,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                          MethodElement methodElement,
                                          boolean requiresReflection,
                                          VisitorContext visitorContext) {
+        needsInitializeCall = true;
         // for "super bean definitions" we just delegate to super
         if (!superBeanDefinition || isPostConstructIntercepted()) {
 //            MethodVisitData methodVisitData = new MethodVisitData(declaringType, methodElement, requiresReflection, methodElement.getAnnotationMetadata(), true, false);
