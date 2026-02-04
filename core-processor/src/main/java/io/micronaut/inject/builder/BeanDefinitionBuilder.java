@@ -4,9 +4,13 @@ import io.micronaut.core.annotation.AnnotationMetadata;
 
 import java.util.List;
 
-public interface BeanDefinitionBuilder<T, M, F> {
+public interface BeanDefinitionBuilder<T, C, M, F> {
 
-    void constructor(ConstructorDefinition<T> constructorDefinition);
+    void constructor(ConstructorDefinition<T, C> constructorDefinition);
+
+    void factoryMethod(MethodDefinition<T, M> methodDefinition);
+
+    void factoryField(FieldDefinition<T, F> fieldDefinition);
 
     void addMethodInjection(MethodDefinition<T, M> methodDefinition);
 
@@ -16,22 +20,25 @@ public interface BeanDefinitionBuilder<T, M, F> {
 
     void addPreDestroy(MethodDefinition<T, M> methodDefinition);
 
-    record ConstructorDefinition<K>(K owningType,
-                                    AnnotationMetadata annotationMetadata,
-                                    List<BeanDefinitionInjectionPoint<K>> injectionPoints,
-                                    boolean requiresReflection) implements AnnotationMetadataProviderRecordStyle {
+    record ConstructorDefinition<K, C>(C constructorElement,
+                                       AnnotationMetadata annotationMetadata,
+                                       List<BeanDefinitionInjectionPoint<K>> injectionPoints,
+                                       boolean requiresReflection) implements MemberDefinition<K> {
     }
 
     record MethodDefinition<K, M>(M methodElement,
                                   AnnotationMetadata annotationMetadata,
                                   List<BeanDefinitionInjectionPoint<K>> injectionPoints,
-                                  boolean requiresReflection) implements AnnotationMetadataProviderRecordStyle {
+                                  boolean requiresReflection) implements MemberDefinition<K> {
     }
 
     record FieldDefinition<K, F>(F fieldElement,
                                  AnnotationMetadata annotationMetadata,
                                  BeanDefinitionInjectionPoint<K> injectionPoint,
                                  boolean requiresReflection,
-                                 boolean isOptional) implements AnnotationMetadataProviderRecordStyle {
+                                 boolean isOptional) implements MemberDefinition<K> {
+    }
+
+    sealed interface MemberDefinition<K> extends AnnotationMetadataProviderRecordStyle {
     }
 }

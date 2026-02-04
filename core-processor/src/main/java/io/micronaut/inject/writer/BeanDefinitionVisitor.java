@@ -71,9 +71,11 @@ public interface BeanDefinitionVisitor extends OriginatingElements, Toggleable {
      * @param factoryMethod The factory method
      * @param parameters    The parameters
      */
-    void visitBeanFactoryMethod(ClassElement factoryClass,
+    default void visitBeanFactoryMethod(ClassElement factoryClass,
                                 MethodElement factoryMethod,
-                                ParameterElement[] parameters);
+                                ParameterElement[] parameters) {
+        visitBeanFactoryMethod(factoryClass, factoryMethod.withParameters(parameters));
+    }
 
     /**
      * <p>In the case where the produced class is produced by a factory field annotated with
