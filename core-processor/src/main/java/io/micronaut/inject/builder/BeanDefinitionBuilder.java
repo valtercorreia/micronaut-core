@@ -29,7 +29,13 @@ public interface BeanDefinitionBuilder<T, C, M, F> {
     record MethodDefinition<K, M>(M methodElement,
                                   AnnotationMetadata annotationMetadata,
                                   List<BeanDefinitionInjectionPoint<K>> injectionPoints,
-                                  boolean requiresReflection) implements MemberDefinition<K> {
+                                  boolean requiresReflection,
+                                  boolean isOptional,
+                                  boolean isSetter) implements MemberDefinition<K> {
+
+        public MethodDefinition(M methodElement, AnnotationMetadata annotationMetadata, List<BeanDefinitionInjectionPoint<K>> injectionPoints, boolean requiresReflection) {
+            this(methodElement, annotationMetadata, injectionPoints, requiresReflection, false, false);
+        }
     }
 
     record FieldDefinition<K, F>(F fieldElement,
