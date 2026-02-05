@@ -1,6 +1,7 @@
 package io.micronaut.inject.builder;
 
 import io.micronaut.core.annotation.AnnotationMetadata;
+import org.jspecify.annotations.Nullable;
 
 import java.util.List;
 
@@ -20,6 +21,10 @@ public interface BeanDefinitionBuilder<T, C, M, F> {
 
     void addPreDestroy(MethodDefinition<T, M> methodDefinition);
 
+    void addFieldConfigurationBuilder(F fieldElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<T, M>> builderMethods);
+
+    void addMethodConfigurationBuilder(M methodElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<T, M>> builderMethods);
+
     record ConstructorDefinition<K, C>(C constructorElement,
                                        AnnotationMetadata annotationMetadata,
                                        List<BeanDefinitionInjectionPoint<K>> injectionPoints,
@@ -31,10 +36,15 @@ public interface BeanDefinitionBuilder<T, C, M, F> {
                                   List<BeanDefinitionInjectionPoint<K>> injectionPoints,
                                   boolean requiresReflection,
                                   boolean isOptional,
-                                  boolean isSetter) implements MemberDefinition<K> {
+                                  boolean isSetter,
+                                  BeanDefinitionInjectionPoint. @Nullable  PropertyInjectionPoint<K> booleanInjectionPoint) implements MemberDefinition<K> {
 
         public MethodDefinition(M methodElement, AnnotationMetadata annotationMetadata, List<BeanDefinitionInjectionPoint<K>> injectionPoints, boolean requiresReflection) {
-            this(methodElement, annotationMetadata, injectionPoints, requiresReflection, false, false);
+            this(methodElement, annotationMetadata, injectionPoints, requiresReflection, false, false, null);
+        }
+
+        public MethodDefinition(M methodElement, AnnotationMetadata annotationMetadata, List<BeanDefinitionInjectionPoint<K>> injectionPoints, boolean requiresReflection, boolean isSetter) {
+            this(methodElement, annotationMetadata, injectionPoints, requiresReflection, false, isSetter, null);
         }
     }
 

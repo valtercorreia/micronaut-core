@@ -9,7 +9,7 @@ public sealed interface BeanDefinitionInjectionPoint<T> extends AnnotationMetada
     record ParameterInjectionPoint<K>(K type, AnnotationMetadata annotationMetadata, String name) implements BeanDefinitionInjectionPoint<K> {
     }
 
-    record PropertyInjectionPoint<K>(K type, AnnotationMetadata annotationMetadata, String parameterName, String value) implements BeanDefinitionInjectionPoint<K> {
+    record PropertyInjectionPoint<K>(K type, AnnotationMetadata annotationMetadata, String propertyName, String propertyPath) implements BeanDefinitionInjectionPoint<K> {
     }
 
     record ValueInjectionPoint<K>(K type, AnnotationMetadata annotationMetadata, String value, boolean hasExpression) implements BeanDefinitionInjectionPoint<K> {

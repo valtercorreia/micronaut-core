@@ -702,17 +702,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private ClassDef.ClassDefBuilder classDefBuilder;
 
-    private final List<InjectMethodCommand> injectCommands = new ArrayList<>();
     private boolean validated;
 
     private final Function<String, ExpressionDef> loadClassValueExpressionFn;
 
     private final List<MethodDefinition<ClassElement, MethodElement>> allMethods = new ArrayList<>();
-    private final List<MethodDefinition<ClassElement, MethodElement>> injectedMethods = new ArrayList<>();
     public final List<MethodDefinition<ClassElement, MethodElement>> postConstructMethods = new ArrayList<>();
     private final List<MethodDefinition<ClassElement, MethodElement>> preDestroyMethods = new ArrayList<>();
     private final List<FieldDefinition<ClassElement, FieldElement>> allFields = new ArrayList<>();
-    private final List<FieldDefinition<ClassElement, FieldElement>> injectedFields = new ArrayList<>();
+
+    private final List<InjectCommand> injectCommands = new ArrayList<>();
 
     private MemberDefinition elementProducerDefinition; // Method, Constructor, orField
     private ConstructorDefinition<ClassElement, MethodElement> constructorDefinition;
@@ -935,7 +934,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     @Override
     public void addMethodInjection(MethodDefinition<ClassElement, MethodElement> methodDefinition) {
-        injectedMethods.add(methodDefinition);
+        injectCommands.add(new InjectMethod(methodDefinition));
         if (shouldKeepInjectionPoint(methodDefinition.annotationMetadata())) {
             allMethods.add(methodDefinition);
         }
@@ -946,6 +945,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         }
     }
 
+    @Override
+    public void addFieldConfigurationBuilder(FieldElement fieldElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<ClassElement, MethodElement>> builderMethods) {
+        injectCommands.add(new InjectFieldConfigurationBuilder(fieldElement, annotationMetadata, builderMethods));
+    }
+
+    @Override
+    public void addMethodConfigurationBuilder(MethodElement methodElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<ClassElement, MethodElement>> builderMethods) {
+        injectCommands.add(new InjectMethodConfigurationBuilder(methodElement, annotationMetadata, builderMethods));
+    }
+
     private boolean shouldKeepInjectionPoint(AnnotationMetadata annotationMetadata1) {
         return keepConfPropInjectPoints || !isConfigurationProperties || !isValueType(annotationMetadata1);
     }
@@ -954,7 +963,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     public void addFieldInjection(FieldDefinition<ClassElement, FieldElement> fieldDefinition) {
         allFields.add(fieldDefinition);
         if (shouldKeepInjectionPoint(fieldDefinition.annotationMetadata())) {
-            injectedFields.add(fieldDefinition);
+            injectCommands.add(new InjectField(fieldDefinition));
         }
         evaluatedExpressionProcessor.processEvaluatedExpressions(fieldDefinition.fieldElement().getAnnotationMetadata(), null);
     }
@@ -1373,9 +1382,9 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         classDefBuilder.addMethod(
             getBuildMethod()
         );
-        if (hasInjections()) {
+        if (!injectCommands.isEmpty()) {
             classDefBuilder.addMethod(
-                getInjectMethod(injectCommands)
+                getInjectMethod()
             );
         }
 
@@ -1523,27 +1532,31 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         ));
     }
 
-    private MethodDef getInjectMethod(List<InjectMethodCommand> injectCommands) {
+    private MethodDef getInjectMethod() {
         return MethodDef.override(INJECT_BEAN_METHOD)
             .build((aThis, methodParameters) -> {
                 return methodParameters.get(2).cast(beanTypeDef).newLocal("beanInstance", instanceVar -> {
                     InjectMethodSignature injectMethodSignature = new InjectMethodSignature(aThis, methodParameters, instanceVar);
                     List<StatementDef> statements = new ArrayList<>();
                     boolean hasInjectPoint = false;
-                    for (InjectMethodCommand injectCommand : injectCommands) {
-                        statements.add(getInjectStatement(injectCommand, injectMethodSignature));
-                        hasInjectPoint |= injectCommand.hasInjectScope();
-                    }
-                    for (MethodDefinition<ClassElement, MethodElement> injectedMethod : injectedMethods) {
-                        statements.add(injectStatement(injectMethodSignature, injectedMethod));
-                        hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(injectedMethod.methodElement().getParameters());
-                    }
+                    for (InjectCommand injectCommand : injectCommands) {
+                        switch (injectCommand) {
+                            case InjectField(var fieldDefinition) -> {
+                                statements.add(
+                                    injectFieldOptionally(injectMethodSignature, fieldDefinition)
+                                );
+                                hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(fieldDefinition.fieldElement());
+                            }
+                            case InjectMethod(var methodDefinition) -> {
+                                statements.add(injectStatement(injectMethodSignature, methodDefinition));
+                                hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(methodDefinition.methodElement().getParameters());
+                            }
+                            case InjectFieldConfigurationBuilder(var fieldElement, var annotationMetadata, var builderMethods) ->
+                                statements.add(getInjectFieldConfigurationBuilder(injectMethodSignature, fieldElement, annotationMetadata, builderMethods));
+                            case InjectMethodConfigurationBuilder(var methodElement, var annotationMetadata, var builderMethods) ->
+                                statements.add(getInjectMethodConfigurationBuilder(injectMethodSignature, methodElement, annotationMetadata, builderMethods));
+                        }
 
-                    for (FieldDefinition<ClassElement, FieldElement> injectedField : injectedFields) {
-                        statements.add(
-                            injectFieldOptionally(injectMethodSignature, injectedField)
-                        );
-                        hasInjectPoint |= BeanDefinitionWriter.hasInjectScope(injectedField.fieldElement());
                     }
 
                     List<StatementDef> returnStatements = new ArrayList<>();
@@ -1585,65 +1598,46 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return injectFieldStatement;
     }
 
-    private StatementDef getInjectStatement(InjectMethodCommand injectionPoint, InjectMethodSignature injectMethodSignature) {
-        if (injectionPoint instanceof ConfigBuilderInjectCommand configBuilderInjectCommand) {
-            ConfigurationBuilderDefinition configurationBuilderDefinition = configBuilderInjectCommand.configurationBuilderDefinition;
-            if (configurationBuilderDefinition instanceof ConfigurationBuilderOfPropertyDefinition definitionList) {
-                String factoryMethod = definitionList.builderElement().getAnnotationMetadata()
-                    .stringValue(ConfigurationBuilder.class, "factoryMethod").orElse(null);
+    private StatementDef getInjectFieldConfigurationBuilder(InjectMethodSignature injectMethodSignature,
+                                                            FieldElement fieldElement,
+                                                            AnnotationMetadata annotationMetadata,
+                                                            List<MethodDefinition<ClassElement, MethodElement>> builderMethods) {
+        String factoryMethod = annotationMetadata
+            .stringValue(ConfigurationBuilder.class, "factoryMethod").orElse(null);
 
-                ClassTypeDef builderType = ClassTypeDef.of(definitionList.builderType());
-                PropertyElement property = definitionList.property();
-                Optional<? extends MemberElement> readMember = property.getReadMember();
-                if (readMember.isPresent()) {
-                    MemberElement memberElement = readMember.get();
-                    if (memberElement instanceof MethodElement method) {
-                        return buildMethodConfigBuilderInvocation(injectMethodSignature, factoryMethod, builderType, method.getName(), definitionList.elements());
-                    }
-                    if (memberElement instanceof FieldElement field) {
-                        return buildFieldConfigBuilderInvocation(injectMethodSignature, factoryMethod, builderType, field.getName(), definitionList.elements());
-                    }
-                }
-                throw new IllegalStateException("Unexpected configuration builder injection point: " + injectMethodSignature);
-            } else if (configurationBuilderDefinition instanceof ConfigurationBuilderOfFieldDefinition fieldDefinition) {
-                String factoryMethod = fieldDefinition.fieldElement().getAnnotationMetadata()
-                    .stringValue(ConfigurationBuilder.class, "factoryMethod").orElse(null);
-                String field = fieldDefinition.fieldElement().getName();
-                ClassTypeDef builderType = ClassTypeDef.of(fieldDefinition.builderType());
-                List<ConfigurationBuilderPropertyDefinition> elements = fieldDefinition.elements();
-                return buildFieldConfigBuilderInvocation(injectMethodSignature, factoryMethod, builderType, field, elements);
-            } else {
-                throw new IllegalStateException("Unknown configuration builder def type: " + configurationBuilderDefinition.getClass());
-            }
-        }
-        throw new IllegalStateException();
-    }
-
-    private StatementDef buildFieldConfigBuilderInvocation(InjectMethodSignature injectMethodSignature, String factoryMethod, ClassTypeDef builderType, String field, List<ConfigurationBuilderPropertyDefinition> elements) {
+        ClassTypeDef builderType = ClassTypeDef.of(fieldElement.getGenericType());
         if (StringUtils.isNotEmpty(factoryMethod)) {
-            return builderType.invokeStatic(factoryMethod, builderType).newLocal("builder" + NameUtils.capitalize(field), builderVar -> {
-                List<StatementDef> statements = getBuilderMethodStatements(injectMethodSignature, elements, (VariableDef.Local) builderVar);
+            return builderType.invokeStatic(factoryMethod, builderType).newLocal("builder" + NameUtils.capitalize(fieldElement.getName()), builderVar -> {
+                List<StatementDef> statements = getBuilderMethodStatements(injectMethodSignature, builderMethods, (VariableDef.Local) builderVar);
 
                 statements.add(injectMethodSignature.instanceVar
-                    .field(field, builderType)
+                    .field(fieldElement)
                     .put(builderVar));
 
                 return StatementDef.multi(statements);
             });
         } else {
             return injectMethodSignature.instanceVar
-                .field(field, builderType)
-                .newLocal("builder" + NameUtils.capitalize(field), builderVar -> StatementDef.multi(
-                    getBuilderMethodStatements(injectMethodSignature, elements, (VariableDef.Local) builderVar)
+                .field(fieldElement)
+                .newLocal("builder" + NameUtils.capitalize(fieldElement.getName()), builderVar -> StatementDef.multi(
+                    getBuilderMethodStatements(injectMethodSignature, builderMethods, (VariableDef.Local) builderVar)
                 ));
         }
     }
 
-    private StatementDef buildMethodConfigBuilderInvocation(InjectMethodSignature injectMethodSignature, String factoryMethod, ClassTypeDef builderType, String methodName, List<ConfigurationBuilderPropertyDefinition> elements) {
+    private StatementDef getInjectMethodConfigurationBuilder(InjectMethodSignature injectMethodSignature,
+                                                             MethodElement builderMethod,
+                                                             AnnotationMetadata annotationMetadata,
+                                                             List<MethodDefinition<ClassElement, MethodElement>> builderMethods) {
+        String factoryMethod = annotationMetadata
+            .stringValue(ConfigurationBuilder.class, "factoryMethod").orElse(null);
+
+        ClassTypeDef builderType = ClassTypeDef.of(builderMethod.getGenericReturnType());
+        String methodName = builderMethod.getName();
         if (StringUtils.isNotEmpty(factoryMethod)) {
             return builderType.invokeStatic(factoryMethod, builderType).newLocal("builder" + NameUtils.capitalize(methodName), builderVar -> {
                 List<StatementDef> statements =
-                    getBuilderMethodStatements(injectMethodSignature, elements, (VariableDef.Local) builderVar);
+                    getBuilderMethodStatements(injectMethodSignature, builderMethods, (VariableDef.Local) builderVar);
 
                 String propertyName = NameUtils.getPropertyNameForGetter(methodName);
                 String setterName = NameUtils.setterNameFor(propertyName);
@@ -1657,17 +1651,18 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return injectMethodSignature.instanceVar
                 .invoke(methodName, builderType)
                 .newLocal("builder" + NameUtils.capitalize(methodName), builderVar -> StatementDef.multi(
-                    getBuilderMethodStatements(injectMethodSignature, elements, (VariableDef.Local) builderVar)
+                    getBuilderMethodStatements(injectMethodSignature, builderMethods, (VariableDef.Local) builderVar)
                 ));
         }
     }
 
     private List<StatementDef> getBuilderMethodStatements(InjectMethodSignature injectMethodSignature,
-                                                          List<ConfigurationBuilderPropertyDefinition> points, VariableDef.Local builderVar) {
-        List<StatementDef> statements = new ArrayList<>();
-        for (ConfigurationBuilderPropertyDefinition builderPoint : points) {
+                                                          List<MethodDefinition<ClassElement, MethodElement>> builderMethods,
+                                                          VariableDef.Local builderVar) {
+        List<StatementDef> statements = new ArrayList<>(builderMethods.size());
+        for (MethodDefinition<ClassElement, MethodElement> builderMethod : builderMethods) {
             statements.add(
-                getConfigBuilderPointStatement(injectMethodSignature, builderVar, builderPoint)
+                getConfigBuilderPointStatement(injectMethodSignature, builderVar, builderMethod)
             );
         }
         return statements;
@@ -1675,17 +1670,21 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private StatementDef getConfigBuilderPointStatement(InjectMethodSignature injectMethodSignature,
                                                         VariableDef.Local builderVar,
-                                                        ConfigurationBuilderPropertyDefinition builderPoint) {
-        boolean isDurationWithTimeUnit = builderPoint.parameter() == null && builderPoint.type().getName().equals(Duration.class.getName());
-        ClassElement paramType = builderPoint.type();
-        Map<String, ClassElement> generics = paramType.getTypeArguments();
-
-        boolean zeroArgs = builderPoint.parameter() == null && !isDurationWithTimeUnit;
+                                                        MethodDefinition<ClassElement, MethodElement> builderPoint) {
+        MethodElement methodElement = builderPoint.methodElement();
+        PropertyInjectionPoint<ClassElement> booleanInjectionPoint = builderPoint.booleanInjectionPoint();
+        boolean zeroArgs = booleanInjectionPoint != null;
+        PropertyInjectionPoint<ClassElement> injectionPoint = booleanInjectionPoint == null ? (PropertyInjectionPoint<ClassElement>) builderPoint.injectionPoints().get(0) : booleanInjectionPoint;
+        String propertyPath = injectionPoint.propertyPath();
+        String propertyName = injectionPoint.propertyName();
+        ClassElement propertyType = injectionPoint.type();
+        ParameterElement parameter = methodElement.getParameters().length == 0 ? null : methodElement.getParameters()[0];
+        Map<String, ClassElement> generics = propertyType.getTypeArguments();
+        boolean isDurationWithTimeUnit = propertyType.getName().equals(Duration.class.getName());
 
         // Optional optional = AbstractBeanDefinition.getValueForPath(...)
-        String propertyPath = builderPoint.path();
-        String localName = builderVar.name() + "_optional" + NameUtils.capitalize(builderPoint.name());
-        return getGetValueForPathCall(injectMethodSignature, paramType, builderPoint.name(), propertyPath, zeroArgs, generics)
+        String localName = builderVar.name() + "_optional" + NameUtils.capitalize(propertyName);
+        return getGetValueForPathCall(injectMethodSignature, propertyType, propertyName, propertyPath, zeroArgs, generics)
             .newLocal(localName, optionalVar -> {
                 return optionalVar.invoke(OPTIONAL_IS_PRESENT_METHOD)
                     .ifTrue(
@@ -1693,8 +1692,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                             if (zeroArgs) {
                                 return valueVar.cast(boolean.class).ifTrue(
                                     StatementDef.doTry(
-                                        builderVar.invoke(builderPoint.method())
-                                    ).doCatch(NoSuchMethodError.class, exceptionVar -> StatementDef.multi())
+                                        builderVar.invoke(methodElement)
+                                    ).doCatch(NoSuchMethodError.class, ignore -> StatementDef.multi())
                                 );
                             }
                             List<ExpressionDef> values = new ArrayList<>(2);
@@ -1708,12 +1707,12 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                     timeInitType.getStaticField("MILLISECONDS", timeInitType)
                                 );
                             } else {
-                                TypeDef paramTypeDef = TypeDef.erasure(paramType);
+                                TypeDef paramTypeDef = TypeDef.erasure(propertyType);
                                 values.add(valueVar.cast(paramTypeDef));
                             }
                             return StatementDef.doTry(
-                                builderVar.invoke(builderPoint.method(), values)
-                            ).doCatch(NoSuchMethodError.class, exceptionVar -> StatementDef.multi());
+                                builderVar.invoke(methodElement, values)
+                            ).doCatch(NoSuchMethodError.class, ignore -> StatementDef.multi());
                         })
                     );
             });
@@ -1722,7 +1721,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     private StatementDef onBeanInstance(VariableDef.This aThis,
                                         List<VariableDef.MethodParameter> methodParameters,
                                         ExpressionDef beanInstance) {
-        boolean needsInjectMethod = hasInjections() || superBeanDefinition;
+        boolean needsInjectMethod = !injectCommands.isEmpty() || superBeanDefinition;
         boolean needsInjectScope = hasInjectScope();
         boolean needsPostConstruct = needsPostConstruct();
         if (!needsInjectScope && !needsInjectMethod && !needsPostConstruct) {
@@ -1754,10 +1753,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
             return StatementDef.multi(statements);
         });
-    }
-
-    private boolean hasInjections() {
-        return !injectCommands.isEmpty() || !injectedMethods.isEmpty() || !injectedFields.isEmpty();
     }
 
     private boolean needsPostConstruct() {
@@ -1907,17 +1902,17 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         );
     }
 
-    private StatementDef buildCustomInstantiate(VariableDef.This aThis,
-                                                 List<VariableDef.MethodParameter> methodParameters,
-                                                 Function<ExpressionDef, StatementDef> onBeanInstance,
-                                                 CustomBuildMethodDefinition constructorBuildMethodDefinition,
-                                                 List<? extends ExpressionDef> values) {
-        List<StatementDef> statements = new ArrayList<>();
-        statements.add(onBeanInstance.apply(
-            constructorBuildMethodDefinition.builder.build(statements, aThis, methodParameters, values)
-        ));
-        return StatementDef.multi(statements);
-    }
+//    private StatementDef buildCustomInstantiate(VariableDef.This aThis,
+//                                                 List<VariableDef.MethodParameter> methodParameters,
+//                                                 Function<ExpressionDef, StatementDef> onBeanInstance,
+//                                                 CustomBuildMethodDefinition constructorBuildMethodDefinition,
+//                                                 List<? extends ExpressionDef> values) {
+//        List<StatementDef> statements = new ArrayList<>();
+//        statements.add(onBeanInstance.apply(
+//            constructorBuildMethodDefinition.builder.build(statements, aThis, methodParameters, values)
+//        ));
+//        return StatementDef.multi(statements);
+//    }
 
     private StatementDef buildFactoryMethodCall(VariableDef.This aThis,
                                                 List<VariableDef.MethodParameter> methodParameters,
@@ -3036,7 +3031,50 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     @Override
     public void visitConfigBuilder(ConfigurationBuilderDefinition builderDefinition) {
-        injectCommands.add(new ConfigBuilderInjectCommand(builderDefinition));
+        switch (builderDefinition) {
+            case ConfigurationBuilderOfFieldDefinition conf -> {
+                addFieldConfigurationBuilder(
+                    conf.fieldElement(),
+                    conf.fieldElement(),
+                    convertBuilderMethods(conf.elements())
+                );
+            }
+            case ConfigurationBuilderOfPropertyDefinition conf -> {
+                PropertyElement property = conf.property();
+                Optional<? extends MemberElement> readMember = property.getReadMember();
+                if (readMember.isPresent()) {
+                    MemberElement memberElement = readMember.get();
+                    if (memberElement instanceof MethodElement method) {
+                        addMethodConfigurationBuilder(
+                            method,
+                            property,
+                            convertBuilderMethods(conf.elements())
+                        );
+                    }
+                    if (memberElement instanceof FieldElement field) {
+                        addFieldConfigurationBuilder(
+                            field,
+                            property,
+                            convertBuilderMethods(conf.elements())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    private List<MethodDefinition<ClassElement, MethodElement>> convertBuilderMethods(List<ConfigurationBuilderPropertyDefinition> elements) {
+        return elements.stream().map(e -> {
+            List<BeanDefinitionInjectionPoint<ClassElement>> injectionPoints = new ArrayList<>();
+            BeanDefinitionInjectionPoint.PropertyInjectionPoint<ClassElement> booleanInjectionPoint = null;
+            MethodElement method = e.method();
+            if (method.getParameters().length == 0) {
+                booleanInjectionPoint = new PropertyInjectionPoint<>(e.type(), e.method(), e.name(), e.path());
+            } else {
+                injectionPoints.add(new PropertyInjectionPoint<>(e.type(), method.getParameters()[0], e.name(), e.path()));
+            }
+            return new MethodDefinition<>(method, method, injectionPoints, false, false, false, booleanInjectionPoint);
+        }).toList();
     }
 
     @Override
@@ -3106,29 +3144,29 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         ExpressionDef valueExpression = getValueBypassingBeanContext(fieldElement.getGenericField(), injectMethodSignature.methodParameters);
         if (valueExpression == null) {
             valueExpression = switch (fieldDefinition.injectionPoint()) {
-                case BeanRegistrationInjectionPoint<ClassElement> v ->
+                case BeanRegistrationInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, GET_BEAN_REGISTRATION_FOR_FIELD, isArray, true, fieldIndex);
 
-                case BeanRegistrationsInjectionPoint<ClassElement> v ->
+                case BeanRegistrationsInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, GET_BEAN_REGISTRATIONS_FOR_FIELD, isArray, true, fieldIndex);
 
-                case BeansInjectionPoint<ClassElement> v ->
+                case BeansInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, GET_BEANS_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
 
-                case MapOfBeansInjectionPoint<ClassElement> v ->
+                case MapOfBeansInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, GET_MAP_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
 
-                case OptionalBeanInjectionPoint<ClassElement> v ->
+                case OptionalBeanInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, FIND_BEAN_FOR_FIELD, isArray, true, fieldIndex);
 
-                case StreamOfBeansInjectionPoint<ClassElement> v ->
+                case StreamOfBeansInjectionPoint<ClassElement> ignore ->
                     resolveFieldValue(injectMethodSignature, fieldElement, GET_STREAM_OF_TYPE_FOR_FIELD, isArray, true, fieldIndex);
 
                 case ParameterInjectionPoint<ClassElement> v -> {
                     throw new IllegalArgumentException("Field injection doesn't support @Parameter");
                 }
                 case PropertyInjectionPoint<ClassElement> v ->
-                    getInvokeGetPropertyValueForField(injectMethodSignature, fieldElement, fieldElement.getAnnotationMetadata(), v.value(), fieldIndex);
+                    getInvokeGetPropertyValueForField(injectMethodSignature, fieldElement, fieldElement.getAnnotationMetadata(), v.propertyPath(), fieldIndex);
 
                 case ValueInjectionPoint<ClassElement> v -> {
                     if (v.hasExpression()) {
@@ -3243,7 +3281,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             requiresReflection,
             parameter.getName()
         );
-        addMethodInjection(new MethodDefinition<>(methodElement, annotationMetadata, List.of(injectionPoint), requiresReflection, isOptional, true));
+        addMethodInjection(new MethodDefinition<>(methodElement, annotationMetadata, List.of(injectionPoint), requiresReflection, isOptional, true, null));
     }
 
     private BeanDefinitionInjectionPoint<ClassElement> createValueInjectionPoint(ClassElement genericType,
@@ -4340,7 +4378,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 );
             }
             case PropertyInjectionPoint<ClassElement> v ->
-                getInvokeGetPropertyValueForConstructor(aThis, methodParameters, index, v.type(), v.parameterName(), v.value());
+                getInvokeGetPropertyValueForConstructor(aThis, methodParameters, index, v.type(), v.propertyName(), v.propertyPath());
             case ValueInjectionPoint<ClassElement> v -> {
                 if (v.hasExpression()) {
                     yield getInvokeGetEvaluatedExpressionValueForConstructorArgument(aThis, index, v.type());
@@ -4382,7 +4420,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 injectMethodParameter(GET_STREAM_OF_TYPE_FOR_METHOD_ARGUMENT, true, v.type(), aThis, methodParameters, methodIndex, parameterIndex, v.annotationMetadata());
             case ParameterInjectionPoint<ClassElement> ignore -> throw new IllegalStateException("Methods cannot have @Parameter");
             case PropertyInjectionPoint<ClassElement> v ->
-                getInvokeGetPropertyValueForMethod(aThis, methodParameters, methodIndex, parameterIndex, v.parameterName(), v.type(), v.value());
+                getInvokeGetPropertyValueForMethod(aThis, methodParameters, methodIndex, parameterIndex, v.propertyName(), v.type(), v.propertyPath());
             case ValueInjectionPoint<ClassElement> v -> {
                 if (v.hasExpression()) {
                     yield getInvokeGetEvaluatedExpressionValueForMethodArgument(aThis, methodIndex, parameterIndex, v.type());
@@ -4428,7 +4466,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                     methodParameters,
                     methodElement.getName(),
                     parameter,
-                    v.value(),
+                    v.propertyPath(),
                     methodDefinition.annotationMetadata(),
                     methodIndex);
             case ValueInjectionPoint<ClassElement> v -> {
@@ -4456,7 +4494,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                                           int index,
                                                           Supplier<VariableDef> constructorMethodVarSupplier,
                                                           AnnotationMetadata am) {
-        boolean isArray = resultType.isArray();
         List<ExpressionDef> values = new ArrayList<>();
         // load the first two arguments of the method (the BeanResolutionContext and the BeanContext) to be passed to the method
         values.add(methodParameters.get(0));
@@ -4473,19 +4510,10 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             getQualifier(am, () -> resolveConstructorArgument(index, constructorMethodVarSupplier.get()))
         );
         ExpressionDef result = aThis.superRef().invoke(methodToInvoke, values);
-        if (isArray && hasGenericType) {
+        if (resultType.isArray() && hasGenericType) {
             result = convertToArray(resultType.fromArray(), result);
         }
         return result.cast(TypeDef.erasure(resultType));
-    }
-
-    private ExpressionDef getInvokeGetPropertyValueForConstructor(VariableDef.This aThis,
-                                                                  List<VariableDef.MethodParameter> methodParameters,
-                                                                  int i,
-                                                                  ParameterElement entry,
-                                                                  String value) {
-
-        return getInvokeGetPropertyValueForConstructor(aThis, methodParameters, i, entry.getType(), entry.getName(), value);
     }
 
     private ExpressionDef getInvokeGetPropertyValueForConstructor(VariableDef.This aThis,
@@ -5179,41 +5207,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     }
 
-    private static final class CustomBuildMethodDefinition extends BuildMethodDefinition {
-        private final CustomInitializerBuilder builder;
-        private final MethodElement constructor;
-
-        private CustomBuildMethodDefinition(CustomInitializerBuilder builder, MethodElement constructor) {
-            this.builder = builder;
-            this.constructor = constructor;
-        }
-
-        @Override
-        ParameterElement[] getParameters() {
-            return constructor.getParameters();
-        }
-    }
-
-    private abstract static sealed class BuildMethodDefinition {
-
-        abstract ParameterElement[] getParameters();
-
-    }
-
-    private record ConfigBuilderInjectCommand(
-        ConfigurationBuilderDefinition configurationBuilderDefinition) implements InjectMethodCommand {
-        @Override
-        public boolean hasInjectScope() {
-            return false;
-        }
-    }
-
-    private interface InjectMethodCommand {
-
-        boolean hasInjectScope();
-
-    }
-
     private record InjectMethodSignature(
         VariableDef.This aThis,
         List<VariableDef.MethodParameter> methodParameters,
@@ -5248,6 +5241,21 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                                FieldDef preStartConditionsField,
                                @Nullable
                                FieldDef postStartConditionsField) {
+    }
+
+    sealed interface InjectCommand {
+    }
+
+    record InjectField(FieldDefinition<ClassElement, FieldElement> fieldDefinition) implements InjectCommand {
+    }
+
+    record InjectMethod(MethodDefinition<ClassElement, MethodElement> methodDefinition) implements InjectCommand {
+    }
+
+    record InjectMethodConfigurationBuilder(MethodElement methodElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<ClassElement, MethodElement>> builderMethods) implements InjectCommand {
+    }
+
+    record InjectFieldConfigurationBuilder(FieldElement fieldElement, AnnotationMetadata annotationMetadata, List<MethodDefinition<ClassElement, MethodElement>> builderMethods) implements InjectCommand {
     }
 
 }
